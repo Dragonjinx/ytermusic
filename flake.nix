@@ -39,7 +39,7 @@
           ];
           meta = {
             description = "TUI based Youtube Music Player that aims to be as fast and simple as possible";
-            homepage = "https://github.com/Dragonjinx/ytermusic";
+            homepage = "https://github.com/ccgauche/ytermusic";
             license = pkgs.lib.licenses.asl20;
             mainProgram = "ytermusic";
             platforms = pkgs.lib.platforms.linux;
