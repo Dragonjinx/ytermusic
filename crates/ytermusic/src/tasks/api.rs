@@ -4,13 +4,16 @@ use flume::Sender;
 use log::{error, info};
 use once_cell::sync::Lazy;
 use tokio::task::JoinSet;
-use ytpapi2::{Endpoint, YoutubeMusicInstance, YoutubeMusicPlaylistRef};
+use ytpapi2::{
+    Endpoint, HeaderMap, HeaderValue, YoutubeMusicInstance, YoutubeMusicPlaylistRef,
+};
 
 use crate::{
     consts::CONFIG,
     get_header_file, run_service,
     structures::performance,
     term::{ManagerMessage, Screens},
+    try_get_cookies,
 };
 
 pub fn get_text_cookies_expired_or_invalid() -> String {
@@ -21,12 +24,29 @@ pub fn get_text_cookies_expired_or_invalid() -> String {
     )
 }
 
+pub async fn build_api() -> Result<YoutubeMusicInstance, ytpapi2::YoutubeMusicError> {
+    if let Some(cookies) = try_get_cookies() {
+        let mut headermap = HeaderMap::new();
+        if let Ok(value) = HeaderValue::from_str(&cookies) {
+            headermap.insert("cookie", value);
+        }
+        headermap.insert(
+            "user-agent",
+            HeaderValue::from_static(
+                "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+            ),
+        );
+        YoutubeMusicInstance::new(headermap, None).await
+    } else {
+        YoutubeMusicInstance::from_header_file(get_header_file().unwrap().1.as_path()).await
+    }
+}
+
 pub fn spawn_api_task(updater_s: Sender<ManagerMessage>) {
     run_service(async move {
         info!("API task on");
         let guard = performance::guard("API task");
-        let client =
-            YoutubeMusicInstance::from_header_file(get_header_file().unwrap().1.as_path()).await;
+        let client = build_api().await;
         match client {
             Ok(api) => {
                 let api = Arc::new(api);
