@@ -18,11 +18,6 @@
         pkgs.rustPlatform.buildRustPackage {
           pname = "ytermusic";
           version = "master";
-          # RELATIVE to the flake's own dir (repo root), NOT `self`: in standalone `nix
-          # build` the flake runtime gives `self` source-tree semantics, but when
-          # imported into a NixOS config via `fixedPoints.fix` (as greyline does),
-          # `self` becomes the flake's *outputs* attrs — so `src = self` would pass
-          # the whole { apps; devShells; packages } set and fail to stringify.
           src = ./.;
           # Resolve deps from the committed Cargo.lock (avoids a stale cargoHash
           # when src/deps change); allowBuiltinFetchGit handles the rusty_ytdl git dep.

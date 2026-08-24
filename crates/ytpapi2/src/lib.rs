@@ -21,9 +21,6 @@ mod string_utils;
 
 pub use json_extractor::YoutubeMusicVideoRef;
 
-/// Canonical, single-sourced Firefox-family user-agent used for YouTube API calls.
-/// Isolated here so every caller (headers fallback, search popup, main API) shares
-/// one value instead of duplicating drifting strings. Bump here to update everywhere.
 pub const YT_USER_AGENT: &str =
     "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
 
