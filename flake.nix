@@ -1,7 +1,7 @@
 {
   description = "ytermusic — a TUI YouTube Music player (with browser-cookie API fix)";
 
-  inputs.nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+  inputs.nixpkgs.url = "github:nixos/nixpkgs/nixos-26.05";
 
   outputs =
     { self, nixpkgs }:
