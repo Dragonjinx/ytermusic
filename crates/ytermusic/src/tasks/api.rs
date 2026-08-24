@@ -6,6 +6,7 @@ use once_cell::sync::Lazy;
 use tokio::task::JoinSet;
 use ytpapi2::{
     Endpoint, HeaderMap, HeaderValue, YoutubeMusicInstance, YoutubeMusicPlaylistRef,
+    YT_USER_AGENT,
 };
 
 use crate::{
@@ -32,9 +33,7 @@ pub async fn build_api() -> Result<YoutubeMusicInstance, ytpapi2::YoutubeMusicEr
         }
         headermap.insert(
             "user-agent",
-            HeaderValue::from_static(
-                "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
-            ),
+            HeaderValue::from_static(YT_USER_AGENT),
         );
         YoutubeMusicInstance::new(headermap, None).await
     } else {

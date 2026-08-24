@@ -21,6 +21,12 @@ mod string_utils;
 
 pub use json_extractor::YoutubeMusicVideoRef;
 
+/// Canonical, single-sourced Firefox-family user-agent used for YouTube API calls.
+/// Isolated here so every caller (headers fallback, search popup, main API) shares
+/// one value instead of duplicating drifting strings. Bump here to update everywhere.
+pub const YT_USER_AGENT: &str =
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
+
 pub type Result<T> = std::result::Result<T, YoutubeMusicError>;
 
 const YTM_DOMAIN: &str = "https://music.youtube.com";
@@ -150,12 +156,7 @@ impl YoutubeMusicInstance {
             return Err(YoutubeMusicError::InvalidHeaders);
         }
         if !headers.contains_key(reqwest::header::USER_AGENT) {
-            headers.insert(
-                reqwest::header::USER_AGENT,
-                "Mozilla/5.0 (X11; Linux x86_64; rv:108.0) Gecko/20100101 Firefox/108.0"
-                    .parse()
-                    .unwrap(),
-            );
+            headers.insert(reqwest::header::USER_AGENT, YT_USER_AGENT.parse().unwrap());
         }
         let account_path = path
             .parent()
