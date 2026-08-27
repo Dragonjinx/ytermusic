@@ -63,6 +63,7 @@
                             pkgs.cargo
                             pkgs.rustfmt
                             pkgs.clippy
+                            pkgs.rust-analyzer
                             pkgs.pkg-config
                             pkgs.openssl
                             pkgs.alsa-lib
