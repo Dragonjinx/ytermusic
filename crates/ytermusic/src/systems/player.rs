@@ -20,14 +20,6 @@ use crate::{
     DATABASE,
 };
 
-/// How long the output-position must stay frozen (while the player thinks it
-/// is playing) before we treat the audio device as stalled. Borrowed from the
-/// stall-detection used by other Linux players (e.g. the `decal` audio
-/// backend discussed in termusic#428): a healthy stream always advances its
-/// position, so a frozen position while not paused/empty means audio can no
-/// longer reach the device.
-const STALL_THRESHOLD: Duration = Duration::from_millis(1000);
-
 /// How long a rebuild worker may take before it is treated as hung (the
 /// device is wedged in ALSA/PipeWire stream negotiation). The worker thread
 /// itself keeps running and is harmless; we only stop waiting and count the
@@ -76,10 +68,6 @@ pub struct PlayerState {
     /// Track/position captured at request time, applied once the rebuilt
     /// stream lands (re-queue + pause).
     pending_requeue: Option<RebuildContext>,
-    /// Last observed sink position, used for stall detection.
-    last_position: Duration,
-    /// When the sink position was last observed advancing.
-    last_position_advance: Instant,
     last_download_list: Vec<String>,
 }
 
@@ -116,8 +104,6 @@ impl PlayerState {
             rebuild_in_flight: false,
             rebuild_started_at: None,
             pending_requeue: None,
-            last_position: Duration::ZERO,
-            last_position_advance: Instant::now(),
             goto: Screens::Playlist,
             list: Vec::new(),
             current: 0,
@@ -162,7 +148,6 @@ impl PlayerState {
         PLAYER_RUNNING.store(self.current().is_some(), Ordering::SeqCst);
         self.update_controls();
         self.handle_stream_errors();
-        self.detect_stall();
         if self.current > self.list.len() {
             self.current = self.list.len();
         }
@@ -264,43 +249,8 @@ impl PlayerState {
         }
     }
 
-    /// Detects when the audio device silently died even though cpal never
-    /// fired its error callback (e.g. a device removed in a way that leaves
-    /// the ALSA/stream state frozen, or a stream that PipeWire stopped
-    /// draining). A healthy playing stream always advances its position, so a
-    /// frozen position while not paused/empty means no audio is reaching the
-    /// device -> recover (rebuild + pause).
-    fn detect_stall(&mut self) {
-        // When paused, between tracks, or at a natural end, the position is
-        // legitimately frozen: just reset the baseline and wait.
-        if self.sink.is_paused() || self.sink.is_finished() {
-            self.last_position = self.sink.elapsed();
-            self.last_position_advance = Instant::now();
-            return;
-        }
-
-        let now = Instant::now();
-        let position = self.sink.elapsed();
-        if is_stalled_at(
-            position,
-            self.last_position,
-            now.duration_since(self.last_position_advance),
-        ) {
-            warn!("Audio output stalled (position frozen while playing); pausing + rebuilding");
-            self.request_recovery("output stalled");
-            // Reset the watchdog so we don't re-fire on every tick if the
-            // rebuild is throttled by the recovery cooldown.
-            self.last_position = self.sink.elapsed();
-            self.last_position_advance = Instant::now();
-        } else {
-            self.last_position = position;
-            self.last_position_advance = now;
-        }
-    }
-
     /// Rebuilds the audio output stream and pauses playback. This is the
-    /// single entry point for any device problem (cpal stream error or a
-    /// detected stall). Rate-limited by the [`RecoveryPolicy`]; gives up after
+    /// single entry point for any device problem (cpal stream error).
     /// repeated failures by surfacing a DeviceLost screen.
     ///
     /// The rebuild itself runs on a worker thread: opening a stream on a
@@ -493,55 +443,9 @@ pub fn player_system(updater: Sender<ManagerMessage>) -> (Sender<SoundAction>, P
     (tx.clone(), PlayerState::new(tx, rx, updater))
 }
 
-/// Pure stall-detection predicate: a healthy playing stream always advances
-/// its position, so a position frozen for >= `STALL_THRESHOLD` (while not
-/// paused/empty, handled by the caller) means audio is no longer reaching the
-/// device.
-fn is_stalled_at(position: Duration, last_position: Duration, since_advance: Duration) -> bool {
-    position == last_position && since_advance >= STALL_THRESHOLD
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const T: Duration = STALL_THRESHOLD;
-
-    #[test]
-    fn advancing_position_is_not_a_stall() {
-        assert!(!is_stalled_at(
-            Duration::from_secs(5),
-            Duration::from_secs(4),
-            T
-        ));
-    }
-
-    #[test]
-    fn frozen_below_threshold_is_not_yet_a_stall() {
-        assert!(!is_stalled_at(
-            Duration::from_secs(5),
-            Duration::from_secs(5),
-            T - Duration::from_millis(1)
-        ));
-    }
-
-    #[test]
-    fn frozen_at_threshold_is_a_stall() {
-        assert!(is_stalled_at(
-            Duration::from_secs(5),
-            Duration::from_secs(5),
-            T
-        ));
-    }
-
-    #[test]
-    fn frozen_past_threshold_is_a_stall() {
-        assert!(is_stalled_at(
-            Duration::from_secs(5),
-            Duration::from_secs(5),
-            T + Duration::from_secs(2)
-        ));
-    }
 
     // --- Async recovery: the rebuild must run off the UI thread ---
     //
