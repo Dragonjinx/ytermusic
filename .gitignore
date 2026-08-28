@@ -1,5 +1,5 @@
 /target
-/data 
+/data
 ytermusic.exe
 headers.txt
 account_id.txt
@@ -14,3 +14,5 @@ muex
 cssparserresult
 
 /result
+.direnv
+.envrc
