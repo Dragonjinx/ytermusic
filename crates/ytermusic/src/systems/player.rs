@@ -28,6 +28,26 @@ use crate::{
 /// longer reach the device.
 const STALL_THRESHOLD: Duration = Duration::from_millis(1000);
 
+/// How long a rebuild worker may take before it is treated as hung (the
+/// device is wedged in ALSA/PipeWire stream negotiation). The worker thread
+/// itself keeps running and is harmless; we only stop waiting and count the
+/// attempt as a failure so the [`RecoveryPolicy`] can surface the DeviceLost
+/// screen.
+const REBUILD_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Context captured when a rebuild is requested, used to re-queue the current
+/// track at the same position once the rebuilt stream lands.
+struct RebuildContext {
+    /// Where the (old) sink was when the device died.
+    position: Duration,
+    /// The track that was current at request time.
+    video: Option<YoutubeMusicVideoRef>,
+    /// Whether that track was already downloaded at request time.
+    downloaded: bool,
+    /// Why the rebuild was requested (for logs).
+    reason: String,
+}
+
 pub struct PlayerState {
     pub goto: Screens,
     pub list: Vec<YoutubeMusicVideoRef>,
@@ -42,6 +62,20 @@ pub struct PlayerState {
     pub soundaction_receiver: Receiver<SoundAction>,
     pub stream_error_receiver: Receiver<PlayError>,
     recovery: RecoveryPolicy,
+    /// Receiver for the result of an audio-device rebuild worker thread.
+    ///
+    /// The rebuild opens a new ALSA/PipeWire stream, which can block
+    /// indefinitely on a wedged device, so it runs on a worker thread and the
+    /// UI thread only ever swaps in the result.
+    rebuild_receiver: Receiver<Result<Player, PlayError>>,
+    /// True while a rebuild worker is running or its result is pending.
+    rebuild_in_flight: bool,
+    /// When the in-flight rebuild was started (watchdog; see
+    /// [`REBUILD_TIMEOUT`]).
+    rebuild_started_at: Option<Instant>,
+    /// Track/position captured at request time, applied once the rebuilt
+    /// stream lands (re-queue + pause).
+    pending_requeue: Option<RebuildContext>,
     /// Last observed sink position, used for stall detection.
     last_position: Duration,
     /// When the sink position was last observed advancing.
@@ -56,6 +90,9 @@ impl PlayerState {
         updater: Sender<ManagerMessage>,
     ) -> Self {
         let (stream_error_sender, stream_error_receiver) = unbounded::<PlayError>();
+        // A fresh channel is created per rebuild worker; this receiver is only
+        // a placeholder until the first rebuild starts.
+        let (_rebuild_tx, rebuild_receiver) = unbounded::<Result<Player, PlayError>>();
         let sink = handle_error_option(
             &updater,
             "player creation error",
@@ -75,6 +112,10 @@ impl PlayerState {
             soundaction_sender,
             sink,
             recovery: RecoveryPolicy::new(),
+            rebuild_receiver,
+            rebuild_in_flight: false,
+            rebuild_started_at: None,
+            pending_requeue: None,
             last_position: Duration::ZERO,
             last_position_advance: Instant::now(),
             goto: Screens::Playlist,
@@ -114,6 +155,10 @@ impl PlayerState {
     }
 
     pub fn update(&mut self) {
+        // Apply any completed device rebuild first, so the rest of the tick
+        // observes the new stream (and its paused state) rather than racing
+        // the worker thread.
+        self.apply_rebuild_result();
         PLAYER_RUNNING.store(self.current().is_some(), Ordering::SeqCst);
         self.update_controls();
         self.handle_stream_errors();
@@ -257,6 +302,10 @@ impl PlayerState {
     /// single entry point for any device problem (cpal stream error or a
     /// detected stall). Rate-limited by the [`RecoveryPolicy`]; gives up after
     /// repeated failures by surfacing a DeviceLost screen.
+    ///
+    /// The rebuild itself runs on a worker thread: opening a stream on a
+    /// wedged device (ALSA/PipeWire negotiation after suspend/resume) blocks
+    /// indefinitely, so doing it here on the UI thread would freeze the TUI.
     fn request_recovery(&mut self, reason: &str) {
         let now = Instant::now();
         if self.recovery.exhausted() {
@@ -267,64 +316,167 @@ impl PlayerState {
             );
             return;
         }
+        if self.rebuild_in_flight {
+            // A rebuild is already being attempted off the UI thread; the
+            // cooldown below plus this guard keep us to one at a time.
+            return;
+        }
         if !self.recovery.should_attempt(now) {
-            // A rebuild is already settling; drop this (logged above).
+            // A rebuild was attempted recently; drop this (logged above).
             return;
         }
         self.recovery.record_attempt(now);
-        match self.rebuild_device() {
-            Ok(()) => {
-                info!("Recovered audio device ({reason}) and paused; press play to resume");
+        self.start_rebuild(reason);
+    }
+
+    /// Manual device rebuild, used by the DeviceLost screen retry
+    /// (`RestartPlayer`). Same worker-thread rebuild as the automatic path, but
+    /// not gated by the recovery cooldown or exhaustion: the user explicitly
+    /// asked to retry.
+    pub(crate) fn restart_player(&mut self) {
+        if self.rebuild_in_flight {
+            info!("Audio-device rebuild already in progress; ignoring manual retry");
+            return;
+        }
+        self.start_rebuild("manual retry");
+    }
+
+    /// Captures everything needed to re-queue the current track once the
+    /// rebuilt stream lands, then spawns a short-lived worker thread that
+    /// re-opens the output device. The UI thread never blocks on the open.
+    fn start_rebuild(&mut self, reason: &str) {
+        let position = self.sink.elapsed();
+        let video = self.current().cloned();
+        let downloaded = self.is_current_downloaded();
+        let volume = self.sink.volume_percent();
+        let error_sender = self.sink.error_sender();
+
+        let (tx, rx) = unbounded::<Result<Player, PlayError>>();
+        let thread_name = format!("yt-audio-rebuild-{reason}");
+        // Re-open the stream from scratch, like `Player::update()`, but on a
+        // worker thread. `Player::update` cannot be used directly: it borrows
+        // the live player, which must stay on the UI thread (controls,
+        // position and stall detection keep working while the rebuild runs).
+        // Re-opening with the current error channel and volume is equivalent
+        // for recovery purposes.
+        let spawn_result = std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                let result = Player::new(error_sender, PlayerOptions::new(volume));
+                let _ = tx.send(result);
+            });
+        match spawn_result {
+            Ok(_) => {
+                self.rebuild_receiver = rx;
+                self.rebuild_in_flight = true;
+                self.rebuild_started_at = Some(Instant::now());
+                self.pending_requeue = Some(RebuildContext {
+                    position,
+                    video,
+                    downloaded,
+                    reason: reason.to_owned(),
+                });
             }
-            Err(fail) => {
-                handle_error(&self.updater, "audio device recovery failed", Err(fail));
+            Err(e) => {
+                error!("Failed to spawn audio-device rebuild thread: {e}");
+                self.recovery.record_failure();
+                handle_error(
+                    &self.updater,
+                    "audio device recovery failed",
+                    Err(PlayError::StreamError(rodio::StreamError::NoDevice)),
+                );
             }
         }
     }
 
-    /// Rebuilds the audio output stream and re-queues the current track at its
-    /// previous position, leaving it **paused**.
-    ///
-    /// Returns Err when the output device could not be reopened (the caller
-    /// surfaces a DeviceLost screen in that case). Records the outcome in the
-    /// [`RecoveryPolicy`] (success resets the consecutive-failure counter,
-    /// failure increments it), so both the automatic path and the manual
-    /// DeviceLost retry (`RestartPlayer`) keep the policy in sync.
-    pub(crate) fn rebuild_device(&mut self) -> Result<(), PlayError> {
-        let position = self.sink.elapsed();
-        let video = self.current().cloned();
-        let downloaded = self.is_current_downloaded();
-
-        let updated = match self.sink.update() {
-            Ok(updated) => updated,
-            Err(e) => {
-                self.recovery.record_failure();
-                return Err(e);
-            }
-        };
-        self.sink = updated;
-        // The device rebuilt successfully: whatever happens to the replay
-        // (e.g. the cached file is missing) is not a device problem, so the
-        // failure counter is reset.
-        self.recovery.record_success();
-
-        if let (true, Some(video)) = (downloaded, video) {
-            let k = CACHE_DIR.join(format!("downloads/{}.mp4", video.video_id));
-            if let Err(e) = self.sink.resume_at(k.as_path(), position) {
-                // The device is fine; the cached file may be missing or
-                // corrupt. Let the normal update loop advance or clean it up.
-                error!("Could not requeue current track after rebuild: {:?}", e);
-            }
-        } else {
-            info!("Rebuilt audio device; the current track will be queued when ready");
+    /// Polls the rebuild worker's result channel and, when a rebuild has
+    /// landed, swaps in the new [`Player`], re-queues the current track at its
+    /// previous position and pauses. Also enforces the rebuild watchdog. Must
+    /// only run on the UI thread: it never opens a device.
+    fn apply_rebuild_result(&mut self) {
+        if !self.rebuild_in_flight {
+            return;
         }
 
+        // Prefer a landed result over the timeout: a slow-but-successful
+        // rebuild must not be discarded just because the watchdog elapsed.
+        if let Ok(result) = self.rebuild_receiver.try_recv() {
+            self.rebuild_in_flight = false;
+            self.rebuild_started_at = None;
+            let ctx = self.pending_requeue.take();
+            match result {
+                Ok(player) => {
+                    self.sink = player;
+                    self.recovery.record_success();
+                    info!(
+                        "Recovered audio device ({}) and paused; press play to resume",
+                        ctx.as_ref()
+                            .map(|c| c.reason.as_str())
+                            .unwrap_or("device error")
+                    );
+                    if let Some(ctx) = ctx {
+                        self.requeue_after_rebuild(&ctx);
+                    } else {
+                        self.sink.pause();
+                    }
+                }
+                Err(fail) => {
+                    self.recovery.record_failure();
+                    handle_error(&self.updater, "audio device recovery failed", Err(fail));
+                }
+            }
+            return;
+        }
+
+        // Watchdog: a rebuild that never lands (device wedged in stream open)
+        // must not keep recovery stuck forever. Count it as a failure so the
+        // policy can eventually surface the DeviceLost screen.
+        if let Some(started) = self.rebuild_started_at {
+            if started.elapsed() >= REBUILD_TIMEOUT {
+                warn!("Audio-device rebuild timed out; counting it as a failure");
+                self.rebuild_in_flight = false;
+                self.rebuild_started_at = None;
+                self.pending_requeue = None;
+                self.recovery.record_failure();
+                handle_error(
+                    &self.updater,
+                    "audio device recovery failed",
+                    Err(PlayError::StreamError(rodio::StreamError::NoDevice)),
+                );
+            }
+        }
+    }
+
+    /// Re-queues the track that was current when the rebuild was requested, at
+    /// its previous position, and pauses. Skipped when the user navigated away
+    /// while the rebuild was in flight (the old track must not be resurrected).
+    fn requeue_after_rebuild(&mut self, ctx: &RebuildContext) {
+        match (ctx.downloaded, &ctx.video) {
+            (true, Some(video)) => {
+                let same_track = self
+                    .current()
+                    .map(|c| c.video_id == video.video_id)
+                    .unwrap_or(false);
+                if !same_track {
+                    info!("Track changed during rebuild; skipping re-queue");
+                } else {
+                    let k = CACHE_DIR.join(format!("downloads/{}.mp4", video.video_id));
+                    if let Err(e) = self.sink.resume_at(k.as_path(), ctx.position) {
+                        // The device is fine; the cached file may be missing or
+                        // corrupt. Let the normal update loop advance or clean it up.
+                        error!("Could not requeue current track after rebuild: {:?}", e);
+                    }
+                }
+            }
+            _ => {
+                info!("Rebuilt audio device; the current track will be queued when ready");
+            }
+        }
         // Pause on any recovery: never auto-resume. This guarantees the player
         // can't keep blasting a broken device, nor switch to another default
         // output (e.g. internal speakers after a headphone/dock removal). The
         // user explicitly resumes from the same spot.
         self.sink.pause();
-        Ok(())
     }
     fn update_controls(&mut self) {
         let current = self.current().cloned();
@@ -389,5 +541,100 @@ mod tests {
             Duration::from_secs(5),
             T + Duration::from_secs(2)
         ));
+    }
+
+    // --- Async recovery: the rebuild must run off the UI thread ---
+    //
+    // Same ALSA-null technique as crates/player/tests/device_recovery.rs: the
+    // default output device of this process is forced to the null PCM, so no
+    // sound can ever reach the real speakers during the test.
+
+    const TEST_ALSA_NULL_CONF: &str = r#"
+# Silence: force the default output device to the null PCM.
+pcm.!default {
+    type null
+}
+"#;
+
+    fn find_alsa_config_dir() -> std::path::PathBuf {
+        if let Some(dir) = std::env::var_os("ALSA_CONFIG_DIR") {
+            let dir = std::path::PathBuf::from(dir);
+            if dir.join("alsa.conf").exists() {
+                return dir;
+            }
+        }
+        for p in ["/etc/alsa", "/usr/share/alsa", "/usr/local/share/alsa"] {
+            let p = std::path::PathBuf::from(p);
+            if p.join("alsa.conf").exists() {
+                return p;
+            }
+        }
+        // NixOS: alsa.conf lives inside the alsa-lib package in the store.
+        if let Ok(store) = std::fs::read_dir("/nix/store") {
+            let mut candidates = store
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .map(|n| n.contains("-alsa-lib-"))
+                        .unwrap_or(false)
+                })
+                .map(|e| e.path().join("share/alsa"))
+                .filter(|p| p.join("alsa.conf").exists())
+                .collect::<Vec<_>>();
+            candidates.sort();
+            if let Some(dir) = candidates.pop() {
+                return dir;
+            }
+        }
+        panic!("could not locate the stock ALSA config dir (alsa.conf)");
+    }
+
+    fn set_null_device() {
+        let config_dir = find_alsa_config_dir();
+        let stock = config_dir.join("alsa.conf");
+        let override_path =
+            std::env::temp_dir().join(format!("ytermusic-alsa-null-{}.conf", std::process::id()));
+        std::fs::write(&override_path, TEST_ALSA_NULL_CONF).expect("write ALSA override config");
+        let config_path = format!("{}:{}", stock.display(), override_path.display());
+        std::env::set_var("ALSA_CONFIG_DIR", &config_dir);
+        std::env::set_var("ALSA_CONFIG_PATH", &config_path);
+    }
+
+    #[test]
+    fn recovery_runs_off_the_ui_thread_and_pauses() {
+        set_null_device();
+
+        let (updater, _updater_rx) = unbounded::<ManagerMessage>();
+        let (_sound_tx, mut ps) = player_system(updater);
+
+        // request_recovery must return immediately: it only spawns a worker
+        // thread; the stream open happens there, never on the UI thread.
+        let start = Instant::now();
+        ps.request_recovery("test");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "request_recovery must not block the UI thread on the device"
+        );
+
+        // update() must keep returning promptly while the rebuild is in
+        // flight, and eventually apply the result (swap + pause).
+        while ps.rebuild_in_flight {
+            let tick = Instant::now();
+            ps.update();
+            assert!(
+                tick.elapsed() < Duration::from_secs(1),
+                "update() must not block on the device rebuild"
+            );
+            assert!(
+                start.elapsed() < REBUILD_TIMEOUT + Duration::from_secs(2),
+                "recovery never landed"
+            );
+        }
+
+        assert!(
+            ps.sink.is_paused(),
+            "pause-on-recovery must be preserved (never auto-resume)"
+        );
     }
 }

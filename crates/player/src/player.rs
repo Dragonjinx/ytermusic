@@ -96,6 +96,16 @@ impl Player {
         self.sink.set_volume(self.data.volume_f32());
     }
 
+    /// The channel this player reports runtime stream errors on.
+    ///
+    /// Device recovery re-opens the output stream on a worker thread (opening
+    /// a stream on a wedged device can block indefinitely), so the app builds
+    /// the replacement stream from scratch with the current error channel and
+    /// volume instead of moving the live player across threads.
+    pub fn error_sender(&self) -> Sender<PlayError> {
+        self.error_sender.clone()
+    }
+
     pub fn is_finished(&self) -> bool {
         self.sink.empty()
     }

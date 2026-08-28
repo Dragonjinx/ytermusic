@@ -7,7 +7,6 @@ use ytpapi2::YoutubeMusicVideoRef;
 
 use crate::{
     consts::CACHE_DIR,
-    errors::handle_error,
     systems::{player::PlayerState, DOWNLOAD_MANAGER},
     ShutdownSignal, DATABASE,
 };
@@ -110,10 +109,9 @@ impl SoundAction {
             Self::RestartPlayer => {
                 // Rebuild the output stream and resume the current track from
                 // its previous position instead of skipping ahead or inserting
-                // a duplicate into the queue.
-                if let Err(e) = player.rebuild_device() {
-                    handle_error(&player.updater, "update player", Err(e));
-                }
+                // a duplicate into the queue. Rebuilds run on a worker thread,
+                // so this never blocks the UI thread on the device.
+                player.restart_player();
             }
             Self::AddVideoUnary(video) => {
                 Self::insert(
