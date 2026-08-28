@@ -30,6 +30,7 @@ unicode-bidi = "0.3"
 
 #  --- Player ---
 player.workspace = true
+rodio = { version = "0.21.1", default-features = false, features = ["playback", "symphonia-aac", "symphonia-isomp4"] }
 
 #  --- Media Control ---
 souvlaki = "0.7.3"

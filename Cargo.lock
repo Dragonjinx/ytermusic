@@ -6230,6 +6230,7 @@ dependencies = [
  "rand 0.8.5",
  "ratatui",
  "raw-window-handle",
+ "rodio",
  "rookie",
  "serde",
  "serde_json",

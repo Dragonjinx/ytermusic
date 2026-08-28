@@ -100,8 +100,18 @@ impl Media {
 
 fn connect(mpris: &mut MediaControls, sender: Sender<SoundAction>) -> Result<(), Error> {
     mpris.attach(move |e| match e {
-        MediaControlEvent::Toggle | MediaControlEvent::Play | MediaControlEvent::Pause => {
+        // Play/Pause map to explicit actions (not a blind toggle) so an
+        // external Pause — e.g. WirePlumber's `linking.pause-playback`, which
+        // pauses a player whose output sink was removed — reliably pauses
+        // instead of accidentally resuming.
+        MediaControlEvent::Toggle => {
             sender.send(SoundAction::PlayPause).unwrap();
+        }
+        MediaControlEvent::Play => {
+            sender.send(SoundAction::Play).unwrap();
+        }
+        MediaControlEvent::Pause => {
+            sender.send(SoundAction::Pause).unwrap();
         }
         MediaControlEvent::Next => {
             sender.send(SoundAction::Next(1)).unwrap();

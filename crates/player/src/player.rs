@@ -17,16 +17,30 @@ pub struct Player {
 }
 
 impl Player {
-    fn try_from_device(device: rodio::cpal::Device) -> Result<OutputStream, PlayError> {
+    fn try_from_device(
+        device: rodio::cpal::Device,
+        error_sender: &Sender<PlayError>,
+    ) -> Result<OutputStream, PlayError> {
+        let sender = error_sender.clone();
         // In rodio 0.21, try_from_device is available on OutputStream
         OutputStreamBuilder::default()
             .with_device(device)
+            // Route runtime stream errors (device lost/unavailable, backend
+            // glitches after suspend/resume) into the app's error channel so
+            // the player can rebuild the output stream instead of silently
+            // keeping a broken device (dead channel / beep after lid close).
+            .with_error_callback(move |err| {
+                log::warn!("Audio output stream error: {err:?}");
+                if sender.try_send(PlayError::DeviceStreamError(err)).is_err() {
+                    log::debug!("Audio error channel closed; dropping stream error");
+                }
+            })
             .open_stream()
             .map_err(PlayError::StreamError)
     }
 
     /// Try to create a stream from the default device, falling back to others
-    fn try_default() -> Result<OutputStream, PlayError> {
+    fn try_default(error_sender: &Sender<PlayError>) -> Result<OutputStream, PlayError> {
         // Use rodio's internal cpal re-export
         let host = rodio::cpal::default_host();
 
@@ -34,11 +48,11 @@ impl Player {
             .default_output_device()
             .ok_or(PlayError::StreamError(rodio::StreamError::NoDevice))?;
 
-        Self::try_from_device(default_device).or_else(|original_err| {
+        Self::try_from_device(default_device, error_sender).or_else(|original_err| {
             let devices = host.output_devices().map_err(|_| original_err)?;
 
             for d in devices {
-                if let Ok(res) = Self::try_from_device(d) {
+                if let Ok(res) = Self::try_from_device(d, error_sender) {
                     return Ok(res);
                 }
             }
@@ -47,7 +61,7 @@ impl Player {
     }
 
     pub fn new(error_sender: Sender<PlayError>, options: PlayerOptions) -> Result<Self, PlayError> {
-        let stream = Self::try_default()?;
+        let stream = Self::try_default(&error_sender)?;
 
         // sink::try_new requires a reference to the handle
         let sink = Sink::connect_new(stream.mixer());
@@ -64,7 +78,7 @@ impl Player {
     }
 
     pub fn update(&self) -> Result<Self, PlayError> {
-        let stream = Self::try_default()?;
+        let stream = Self::try_default(&self.error_sender)?;
         let sink = Sink::connect_new(stream.mixer());
 
         sink.set_volume(self.data.volume_f32());
@@ -125,6 +139,20 @@ impl Player {
         self.sink.set_volume(self.data.volume_f32());
         self.sink.append(decoder);
 
+        Ok(())
+    }
+
+    /// Plays `path` starting from `time`, used to resume playback after an
+    /// audio device rebuild.
+    ///
+    /// Unlike [`Player::play_at`], a failed seek is only logged: during
+    /// recovery the device is known to be healthy again, so a poster-without
+    /// seeking failure must not surface a DeviceLost screen.
+    pub fn resume_at(&mut self, path: &Path, time: Duration) -> Result<(), PlayError> {
+        self.play(path)?;
+        if let Err(e) = self.sink.try_seek(time) {
+            log::warn!("Could not seek to {time:?} after device rebuild: {e:?}");
+        }
         Ok(())
     }
 

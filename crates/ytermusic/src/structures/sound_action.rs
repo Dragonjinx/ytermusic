@@ -7,7 +7,7 @@ use ytpapi2::YoutubeMusicVideoRef;
 
 use crate::{
     consts::CACHE_DIR,
-    errors::handle_error_option,
+    errors::handle_error,
     systems::{player::PlayerState, DOWNLOAD_MANAGER},
     ShutdownSignal, DATABASE,
 };
@@ -19,6 +19,8 @@ pub enum SoundAction {
     SetVolume(f32),
     Cleanup,
     PlayPause,
+    Play,
+    Pause,
     RestartPlayer,
     Plus,
     Minus,
@@ -60,6 +62,16 @@ impl SoundAction {
             Self::Backward => player.sink.seek_bw(),
             Self::Forward => player.sink.seek_fw(),
             Self::PlayPause => player.sink.toggle_playback(),
+            Self::Play => {
+                if player.sink.is_paused() {
+                    player.sink.resume();
+                }
+            }
+            Self::Pause => {
+                if !player.sink.is_paused() {
+                    player.sink.pause();
+                }
+            }
             Self::Cleanup => {
                 player.list.clear();
                 player.current = 0;
@@ -96,11 +108,11 @@ impl SoundAction {
                 player.sink.stop();
             }
             Self::RestartPlayer => {
-                player.sink =
-                    handle_error_option(&player.updater, "update player", player.sink.update())
-                        .unwrap();
-                if let Some(e) = player.current().cloned() {
-                    Self::AddVideoUnary(e).apply_sound_action(player);
+                // Rebuild the output stream and resume the current track from
+                // its previous position instead of skipping ahead or inserting
+                // a duplicate into the queue.
+                if let Err(e) = player.rebuild_device() {
+                    handle_error(&player.updater, "update player", Err(e));
                 }
             }
             Self::AddVideoUnary(video) => {
