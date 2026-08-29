@@ -148,6 +148,13 @@ impl PlayerState {
         PLAYER_RUNNING.store(self.current().is_some(), Ordering::SeqCst);
         self.update_controls();
         self.handle_stream_errors();
+        // Advance the pre-download spinner so it visibly rotates while yt-dlp
+        // is still resolving/negotiating (before any real percentage exists).
+        for status in self.music_status.values_mut() {
+            if let MusicDownloadStatus::Spinner(frame) = status {
+                *frame = frame.wrapping_add(1);
+            }
+        }
         if self.current > self.list.len() {
             self.current = self.list.len();
         }

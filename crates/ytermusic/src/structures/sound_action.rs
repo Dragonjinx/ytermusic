@@ -46,7 +46,11 @@ impl SoundAction {
         }
         if matches!(
             player.music_status.get(&video),
-            Some(&MusicDownloadStatus::Downloading(_) | &MusicDownloadStatus::Downloaded)
+            Some(
+                &MusicDownloadStatus::Downloading(_)
+                    | &MusicDownloadStatus::Spinner(_)
+                    | &MusicDownloadStatus::Downloaded
+            )
         ) && status == MusicDownloadStatus::NotDownloaded
         {
             return;
@@ -142,6 +146,7 @@ impl SoundAction {
                     Some(
                         &MusicDownloadStatus::DownloadFailed
                             | &MusicDownloadStatus::Downloading(_)
+                            | &MusicDownloadStatus::Spinner(_)
                             | &MusicDownloadStatus::NotDownloaded
                     )
                 ) {

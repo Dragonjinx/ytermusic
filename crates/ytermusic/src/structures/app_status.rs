@@ -26,7 +26,7 @@ impl MusicDownloadStatusExt for MusicDownloadStatus {
                     CONFIG.player.text_next_style
                 }
             }
-            Self::Downloading(_) => CONFIG.player.text_downloading_style,
+            Self::Downloading(_) | Self::Spinner(_) => CONFIG.player.text_downloading_style,
             Self::DownloadFailed => CONFIG.player.text_error_style,
         };
         if playing.is_some() {
